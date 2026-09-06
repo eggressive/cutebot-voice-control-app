@@ -21,10 +21,34 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            // Release signing credentials are read from local.properties or environment
+            // variables and MUST NOT be committed to version control. If no credentials
+            // are provided the release build still produces an unsigned APK/AAB.
+            def storeFilePath = project.findProperty("RELEASE_STORE_FILE")
+                ?: System.getenv("RELEASE_STORE_FILE")
+            if (storeFilePath != null) {
+                storeFile file(storeFilePath)
+                storePassword project.findProperty("RELEASE_STORE_PASSWORD")
+                    ?: System.getenv("RELEASE_STORE_PASSWORD")
+                keyAlias project.findProperty("RELEASE_KEY_ALIAS")
+                    ?: System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword project.findProperty("RELEASE_KEY_PASSWORD")
+                    ?: System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // Only sign if a keystore was configured above.
+            if (signingConfigs.release.storeFile != null) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled true
             shrinkResources true
+            zipAlignEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
@@ -42,6 +66,14 @@ android {
         // Runtime permission checks are present; lint cannot trace them across methods.
         disable 'MissingPermission'
         checkDependencies true
+    }
+
+    packagingOptions {
+        jniLibs {
+            // Keep native libraries uncompressed in the APK so the linker can load
+            // them directly. Reduces on-device install size for Vosk.
+            useLegacyPackaging true
+        }
     }
 }
 

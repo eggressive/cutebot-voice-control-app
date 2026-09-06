@@ -78,6 +78,45 @@ Requires JDK 17 and the Android SDK (platform 34, build-tools 34).
 - `BLUETOOTH` / `BLUETOOTH_ADMIN` (Android 11 and below)
 - `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` (BLE scanning on Android 6 through 11)
 
+## Release build
+
+```bash
+./gradlew assembleRelease
+# Unsigned APK at app/build/outputs/apk/release/app-release-unsigned.apk
+```
+
+### Signing
+
+To produce a signed release APK, create a keystore and add these properties to
+`local.properties` (never commit this file):
+
+```properties
+RELEASE_STORE_FILE=/path/to/cutebot.keystore
+RELEASE_STORE_PASSWORD=your-store-password
+RELEASE_KEY_ALIAS=cutebot
+RELEASE_KEY_PASSWORD=your-key-password
+```
+
+You can also set them as environment variables with the same names. If no
+keystore is configured, the build still succeeds and produces an unsigned APK.
+
+For Google Play you should build an Android App Bundle (AAB) instead:
+
+```bash
+./gradlew bundleRelease
+# AAB at app/build/outputs/bundle/release/app-release.aab
+```
+
+### What the release config does
+
+- R8 code shrinking and obfuscation.
+- Resource shrinking (`shrinkResources`).
+- APK/ZIP alignment (`zipAlignEnabled`).
+- Native ABI filtering: only `arm64-v8a` and `armeabi-v7a` are bundled.
+- `android:allowBackup="false"` + `dataExtractionRules` to prevent the large
+  Vosk models from being backed up to the cloud.
+- `android:largeHeap="true"` to give Vosk more runtime memory headroom.
+
 ## Size / optimization notes
 
 The debug APK is ~120 MB because both Vosk speech models are bundled. Most of
