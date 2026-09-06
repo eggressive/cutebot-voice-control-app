@@ -1,0 +1,150 @@
+RELEASE CHECKLIST
+=================
+
+Cutebot Voice Control - Android app release notes and build instructions.
+
+PREREQUISITES
+-------------
+
+1. JDK 17 installed and selected (this project uses sdkman + Temurin 17).
+2. Android SDK with platform 34 and build-tools 34.
+3. Speech models downloaded:
+
+   ./fetch-models.sh
+
+   This downloads ~134 MB of Vosk models into app/src/main/assets/.
+   The models are NOT committed to git.
+
+4. A release signing keystore (only needed for signed APK/AAB).
+
+   Create one with:
+
+   keytool -genkey -v \
+     -keystore cutebot.keystore \
+     -keyalg RSA \
+     -keysize 2048 \
+     -validity 10000 \
+     -alias cutebot
+
+   Keep the keystore file and passwords safe. They cannot be recovered if lost.
+
+RELEASE CONFIGURATION
+---------------------
+
+Release signing credentials are read from app/local.properties or environment
+variables. They must NEVER be committed to version control.
+
+Add to app/local.properties:
+
+   RELEASE_STORE_FILE=/absolute/path/to/cutebot.keystore
+   RELEASE_STORE_PASSWORD=your-store-password
+   RELEASE_KEY_ALIAS=cutebot
+   RELEASE_KEY_PASSWORD=your-key-password
+
+Alternative: set the same names as environment variables.
+
+If no keystore is configured, the release build still produces an unsigned APK:
+
+   app/build/outputs/apk/release/app-release-unsigned.apk
+
+BEFORE EVERY RELEASE
+--------------------
+
+1. Update versionCode and versionName in app/build.gradle:
+
+   defaultConfig {
+       versionCode 2
+       versionName "1.1"
+   }
+
+2. Run lint and both build variants:
+
+   ./gradlew clean assembleDebug lintDebug assembleRelease
+
+3. Test the release build on real hardware (Moto G14). Debug and release
+   behavior can differ because of R8 shrinking.
+
+4. Verify voice commands in Dutch and English, BLE connect/disconnect,
+   permission denial paths, and the STOP button.
+
+BUILD OUTPUTS
+-------------
+
+Debug APK:
+   ./gradlew assembleDebug
+   app/build/outputs/apk/debug/app-debug.apk
+
+Release APK:
+   ./gradlew assembleRelease
+   app/build/outputs/apk/release/app-release.apk            (signed)
+   app/build/outputs/apk/release/app-release-unsigned.apk   (unsigned)
+
+Android App Bundle (AAB) - required for Google Play:
+   ./gradlew bundleRelease
+   app/build/outputs/bundle/release/app-release.aab
+
+CURRENT SIZE
+------------
+
+The release APK is dominated by the bundled Vosk speech models.
+
+   Release unsigned APK: ~84 MB
+   Debug APK:            ~90 MB
+   Models total:         ~134 MB uncompressed (~133 MB compressed in APK)
+
+Size breakdown of release APK:
+   Vosk models:  ~133 MB compressed
+   Native libs:  ~17 MB  (arm64-v8a + armeabi-v7a only)
+   App code/DEX: <1 MB
+
+ABI FILTERING
+-------------
+
+Only arm64-v8a and armeabi-v7a ABIs are bundled. The Moto G14 uses arm64-v8a.
+armeabi-v7a is kept for broader compatibility with older phones. x86, x86_64,
+mips, and mips64 are excluded to reduce APK size.
+
+MANIFEST / BACKUP NOTES
+-----------------------
+
+The app disables cloud backup because the Vosk models are huge binaries that
+should never be uploaded to Google Backup. This is configured via:
+
+   android:allowBackup="false"
+   android:fullBackupContent="false"
+   android:dataExtractionRules="@xml/data_extraction_rules"
+
+The data extraction rules file is at:
+   app/src/main/res/xml/data_extraction_rules.xml
+
+KNOWN ISSUES / WARNINGS
+-----------------------
+
+1. Lint reports 3 benign warnings:
+   - Two GradleDependency warnings about newer androidx.core and appcompat
+     versions being available. These are kept for stability.
+   - One UnusedAttribute warning about usesPermissionFlags on BLUETOOTH_SCAN
+     being ignored on API < 31. This is expected and harmless.
+
+2. Native libraries cannot be stripped by the Android build tools:
+      Unable to strip the following libraries, packaging them as they are:
+      libjnidispatch.so, libvosk.so
+   This is normal for prebuilt Vosk/JNA binaries and does not affect runtime.
+
+PLAY STORE UPLOAD
+-----------------
+
+1. Build the AAB:
+
+   ./gradlew bundleRelease
+
+2. Sign in to Google Play Console.
+3. Create/choose the app and upload app/build/outputs/bundle/release/app-release.aab.
+4. Configure internal testing first, then promote to production.
+5. Provide a privacy policy URL if the app targets children or uses
+   RECORD_AUDIO / Bluetooth permissions.
+
+Sideload install:
+
+   adb install app/build/outputs/apk/release/app-release.apk
+
