@@ -226,9 +226,9 @@ class MainActivity : AppCompatActivity() {
             lower.contains("back") || lower.contains("achteruit") || lower.contains("achter") -> "5"
             else -> return
         }
-        // Debounce: skip if the same command was sent within the last 1.5s.
+        // Debounce: skip if the same command was sent within the last 0.5s.
         val now = System.currentTimeMillis()
-        if (command == lastSentCommand && now - lastSentAt < 1500) {
+        if (command == lastSentCommand && now - lastSentAt < 500) {
             return
         }
         lastSentCommand = command
