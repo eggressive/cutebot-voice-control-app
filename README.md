@@ -25,6 +25,10 @@ the companion MakeCode firmware) only maps incoming bytes to motor commands.
 A physical **STOP** button sends `4` instantly. A **language toggle** switches
 between Dutch (default) and English.
 
+Commands are matched by whole word to avoid false positives (e.g. "bright"
+no longer triggers "right"). Only final recognition results control the car;
+partial results are shown on screen but not sent.
+
 ## Companion firmware
 
 The micro:bit half lives in a separate repo:
@@ -54,6 +58,9 @@ Offline, on-device speech recognition via
 - English: `vosk-model-small-en-us-0.15`
 - Dutch: `vosk-model-small-nl-0.22`
 
+Dutch is loaded at startup; English is loaded lazily the first time you toggle
+to it, to reduce cold-start time and memory pressure.
+
 ## Build
 
 Requires JDK 17 and the Android SDK (platform 34, build-tools 34).
@@ -69,4 +76,20 @@ Requires JDK 17 and the Android SDK (platform 34, build-tools 34).
 - `RECORD_AUDIO` (speech recognition)
 - `BLUETOOTH_SCAN` / `BLUETOOTH_CONNECT` (Android 12+)
 - `BLUETOOTH` / `BLUETOOTH_ADMIN` (Android 11 and below)
-- `ACCESS_FINE_LOCATION` (required for BLE scanning on Android 6 through 11)
+- `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` (BLE scanning on Android 6 through 11)
+
+## Size / optimization notes
+
+The debug APK is ~120 MB because both Vosk speech models are bundled. Most of
+that is the models; the app code is tiny. Options to shrink it:
+
+1. **Bundle only Dutch** (cuts APK to ~60 MB). Since the grandson is Dutch and
+   Dutch is the default, this is the easiest win. English could then be
+   downloaded on first toggle.
+2. **Download both models at runtime** (APK drops to ~5 MB). This needs the
+   `INTERNET` permission, a download + unzip implementation, and a one-time
+   network setup.
+3. **Use smaller / custom Vosk models** for the small command vocabulary.
+   Training a custom model is more work but could get the model under 10 MB.
+
+The current build keeps both models offline to avoid any network dependency.

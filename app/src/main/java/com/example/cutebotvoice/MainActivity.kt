@@ -10,12 +10,17 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
 import android.provider.Settings
 import android.util.Log
 import android.widget.Button
@@ -24,6 +29,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
 import org.vosk.LibVosk
 import org.vosk.LogLevel
 import org.vosk.Model
@@ -40,7 +46,14 @@ import java.util.UUID
 //   6e400003 = RX  (phone -> micro:bit, WRITE)  <- the phone writes to THIS one
 private val NUS_SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
 private val NUS_WRITE_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
-private val NUS_NOTIFY_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+
+private const val TAG = "Cutebot"
+private const val REQUEST_RECORD_AUDIO = 1
+private const val REQUEST_BLUETOOTH = 2
+
+private const val SCAN_TIMEOUT_MS = 15_000L
+private const val COMMAND_DEBOUNCE_MS = 400L
+private const val SPEECH_SAMPLE_RATE = 16000.0f
 
 class MainActivity : AppCompatActivity() {
 
@@ -49,10 +62,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stopButton: Button
     private lateinit var langButton: Button
 
+    private val handler = Handler(Looper.getMainLooper())
     private var bluetoothGatt: BluetoothGatt? = null
-    private var txCharacteristic: BluetoothGattCharacteristic? = null
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var isWriting = false
+    private val writeQueue = ArrayDeque<ByteArray>()
 
-    // Vosk speech recognition (offline, English + Dutch models bundled).
+    // Vosk speech recognition (offline). Dutch is loaded immediately; English is
+    // lazy-loaded the first time the user toggles to it, to reduce startup cost.
     private var modelEn: Model? = null
     private var modelNl: Model? = null
     private var currentModel: Model? = null
@@ -60,7 +77,7 @@ class MainActivity : AppCompatActivity() {
     private var listeningContinuously: Boolean = false
     private var lastSentCommand: String? = null
     private var lastSentAt: Long = 0L
-    private var useDutch: Boolean = true  // grandson is Dutch; default to Dutch
+    private var useDutch: Boolean = true
 
     private val bluetoothAdapter: BluetoothAdapter?
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -78,17 +95,44 @@ class MainActivity : AppCompatActivity() {
 
         listenButton.setOnClickListener { onListenClicked() }
         stopButton.setOnClickListener { writeCommand("4") }
-        langButton.setOnClickListener { toggleLanguage() }
+        langButton.setOnClickListener { onToggleLanguage() }
 
-        requestBluetoothPermissions()
         initModels()
+        requestBluetoothPermissions()
+    }
+
+    // --- lifecycle ---
+
+    override fun onResume() {
+        super.onResume()
+        if (bluetoothGatt == null) {
+            requestBluetoothPermissions()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        stopScan()
+        stopListening()
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        stopListening()
+        closeModels()
+        disconnectGatt()
+        super.onDestroy()
     }
 
     // --- Vosk models + speech ---
 
     private fun initModels() {
-        // Unpack both models. Dutch is the default (grandson is Dutch); English is
-        // available via the language toggle. Both share the same command map.
+        // Load Dutch immediately because it is the default. English is loaded
+        // lazily on first toggle to reduce cold-start time and memory pressure.
+        loadDutchModel()
+    }
+
+    private fun loadDutchModel() {
         StorageService.unpack(
             this, "model-nl", "model-nl",
             { m ->
@@ -99,29 +143,43 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             { e ->
-                Log.e("Cutebot", "Failed to unpack Dutch model", e)
+                Log.e(TAG, "Failed to unpack Dutch model", e)
                 updateStatus(getString(R.string.status_model_error))
-            }
-        )
-        StorageService.unpack(
-            this, "model-en-us", "model-en-us",
-            { m ->
-                modelEn = m
-                if (!useDutch) {
-                    currentModel = m
-                    updateStatus(getString(R.string.status_ready))
-                }
-            },
-            { e ->
-                Log.e("Cutebot", "Failed to unpack English model", e)
             }
         )
     }
 
-    private fun toggleLanguage() {
+    private fun loadEnglishModel(onReady: () -> Unit) {
+        val existing = modelEn
+        if (existing != null) {
+            onReady()
+            return
+        }
+        updateStatus(getString(R.string.status_loading_english))
+        StorageService.unpack(
+            this, "model-en-us", "model-en-us",
+            { m ->
+                modelEn = m
+                onReady()
+            },
+            { e ->
+                Log.e(TAG, "Failed to unpack English model", e)
+                updateStatus(getString(R.string.status_model_error))
+            }
+        )
+    }
+
+    private fun onToggleLanguage() {
         useDutch = !useDutch
-        currentModel = if (useDutch) modelNl else modelEn
-        updateStatus(getString(if (useDutch) R.string.lang_dutch else R.string.lang_english))
+        if (useDutch) {
+            currentModel = modelNl
+            updateStatus(getString(R.string.lang_dutch))
+        } else {
+            loadEnglishModel {
+                currentModel = modelEn
+                updateStatus(getString(R.string.lang_english))
+            }
+        }
     }
 
     private fun onListenClicked() {
@@ -148,13 +206,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
         try {
-            val rec = Recognizer(m, 16000.0f)
-            speechService = SpeechService(rec, 16000.0f)
+            speechService?.stop()
+            val rec = Recognizer(m, SPEECH_SAMPLE_RATE)
+            speechService = SpeechService(rec, SPEECH_SAMPLE_RATE)
             speechService?.startListening(recognitionListener)
             listeningContinuously = true
+            updateListenButtonState()
             updateStatus(getString(R.string.status_listening))
         } catch (e: IOException) {
-            Log.e("Cutebot", "Failed to start speech service", e)
+            Log.e(TAG, "Failed to start speech service", e)
             updateStatus(getString(R.string.status_model_error))
         }
     }
@@ -163,13 +223,14 @@ class MainActivity : AppCompatActivity() {
         listeningContinuously = false
         speechService?.stop()
         speechService = null
+        updateListenButtonState()
     }
 
     private val recognitionListener = object : RecognitionListener {
         override fun onPartialResult(hypothesis: String) {
             val text = extractText(hypothesis) ?: return
             updateStatus(getString(R.string.status_heard, text))
-            handleCommand(text)
+            // Do not send motor commands on partial results; wait for final.
         }
 
         override fun onResult(hypothesis: String) {
@@ -182,58 +243,85 @@ class MainActivity : AppCompatActivity() {
             val text = extractText(hypothesis) ?: return
             updateStatus(getString(R.string.status_heard, text))
             handleCommand(text)
+            if (listeningContinuously) {
+                restartListeningSoon()
+            }
         }
 
         override fun onError(e: Exception) {
-            Log.e("Cutebot", "Speech error", e)
+            Log.e(TAG, "Speech error", e)
             updateStatus(getString(R.string.speech_error_internal, 0))
+            if (listeningContinuously) {
+                restartListeningSoon()
+            }
         }
 
         override fun onTimeout() {
-            // Vosk times out after silence; restart if still in continuous mode.
             if (listeningContinuously) {
                 restartListeningSoon()
             }
         }
     }
 
-    // Vosk returns JSON like {"text": "left"}. Extract the "text" field.
-    private fun extractText(hypothesis: String): String? {
-        val start = hypothesis.indexOf("\"text\"")
-        if (start < 0) return null
-        val colon = hypothesis.indexOf(':', start)
-        if (colon < 0) return null
-        val quote = hypothesis.indexOf('"', colon + 1)
-        if (quote < 0) return null
-        val end = hypothesis.indexOf('"', quote + 1)
-        if (end < 0) return null
-        return hypothesis.substring(quote + 1, end)
+    private fun restartListeningSoon() {
+        handler.removeCallbacks(restartListeningRunnable)
+        handler.postDelayed(restartListeningRunnable, 400)
     }
 
-    private fun restartListeningSoon() {
-        listenButton.postDelayed({ startListening() }, 400)
+    private val restartListeningRunnable = Runnable { startListening() }
+
+    // Vosk returns JSON like {"text": "left"}. Extract the "text" field safely.
+    private fun extractText(hypothesis: String): String? {
+        return try {
+            val text = JSONObject(hypothesis).optString("text", "")
+            text.ifEmpty { null }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse Vosk hypothesis: $hypothesis", e)
+            null
+        }
     }
 
     // --- command map (matches the micro:bit firmware) ---
 
     private fun handleCommand(text: String) {
         val lower = text.lowercase()
-        val command = when {
-            lower.contains("forward") || lower.contains("vooruit") -> "1"
-            lower.contains("left") || lower.contains("links") -> "2"
-            lower.contains("right") || lower.contains("rechts") -> "3"
-            lower.contains("stop") || lower.contains("halt") -> "4"
-            lower.contains("back") || lower.contains("achteruit") || lower.contains("achter") -> "5"
-            else -> return
-        }
-        // Debounce: skip if the same command was sent within the last 0.5s.
+        val command = findCommand(lower) ?: return
+
+        // Debounce: skip if the same command was sent within the last 0.4s.
         val now = System.currentTimeMillis()
-        if (command == lastSentCommand && now - lastSentAt < 500) {
+        if (command == lastSentCommand && now - lastSentAt < COMMAND_DEBOUNCE_MS) {
             return
         }
         lastSentCommand = command
         lastSentAt = now
         writeCommand(command)
+    }
+
+    private fun findCommand(text: String): String? {
+        // Match whole words only to avoid false positives (e.g. "bright" matching "right").
+        // Order matters: check longer/narrower forms before shorter ones where they share
+        // a prefix (e.g. "achteruit" vs "achter").
+        val patterns = listOf(
+            listOf("forward", "vooruit") to "1",
+            listOf("left", "links") to "2",
+            listOf("right", "rechts") to "3",
+            listOf("stop", "halt") to "4",
+            listOf("back", "achteruit") to "5",
+            listOf("achter") to "5"
+        )
+        for ((words, command) in patterns) {
+            for (word in words) {
+                if (containsWholeWord(text, word)) {
+                    return command
+                }
+            }
+        }
+        return null
+    }
+
+    private fun containsWholeWord(text: String, word: String): Boolean {
+        val regex = ("""\b""" + Regex.escape(word) + """\b""").toRegex()
+        return regex.containsMatchIn(text)
     }
 
     @SuppressLint("MissingPermission")
@@ -242,35 +330,67 @@ class MainActivity : AppCompatActivity() {
             updateStatus(getString(R.string.status_not_connected))
             return
         }
-        val characteristic = txCharacteristic
-        if (characteristic == null) {
+        val gatt = bluetoothGatt
+        val characteristic = writeCharacteristic
+        if (gatt == null || characteristic == null) {
             updateStatus(getString(R.string.status_not_connected))
             return
         }
         val payload = (command + "\n").toByteArray()
-        val gatt = bluetoothGatt
-        if (gatt == null) {
-            updateStatus(getString(R.string.status_not_connected))
+        synchronized(writeQueue) {
+            writeQueue.add(payload)
+            if (!isWriting) {
+                flushWriteQueue(gatt, characteristic)
+            }
+        }
+        // Optimistic feedback: the write was enqueued/initiated successfully.
+        updateStatus(getString(R.string.status_sent, command))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun flushWriteQueue(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        val next: ByteArray
+        synchronized(writeQueue) {
+            next = writeQueue.removeFirstOrNull() ?: run {
+                isWriting = false
+                return
+            }
+            isWriting = true
+        }
+
+        val properties = characteristic.properties
+        val (writeType, supported) = when {
+            (properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 ->
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE to true
+            (properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 ->
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT to true
+            else -> BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT to false
+        }
+        if (!supported) {
+            Log.e(TAG, "Write characteristic does not support WRITE or WRITE_NO_RESPONSE")
+            updateStatus(getString(R.string.status_tx_not_found))
+            synchronized(writeQueue) { isWriting = false }
             return
         }
+
         val written = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val status = gatt.writeCharacteristic(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-            Log.d("Cutebot", "writeCharacteristic status=$status")
+            val status = gatt.writeCharacteristic(characteristic, next, writeType)
+            Log.d(TAG, "writeCharacteristic status=$status")
             status == android.bluetooth.BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            characteristic.writeType = writeType
             @Suppress("DEPRECATION")
-            characteristic.value = payload
+            characteristic.value = next
             @Suppress("DEPRECATION")
             val ok = gatt.writeCharacteristic(characteristic)
-            Log.d("Cutebot", "writeCharacteristic (legacy) returned=$ok")
+            Log.d(TAG, "writeCharacteristic (legacy) returned=$ok")
             ok
         }
-        if (written) {
-            updateStatus(getString(R.string.status_sent, command))
-        } else {
-            updateStatus(getString(R.string.status_write_failed, command))
+        if (!written) {
+            Log.w(TAG, "Failed to enqueue BLE write")
+            updateStatus(getString(R.string.status_write_failed, String(next, Charsets.UTF_8).trim()))
+            synchronized(writeQueue) { isWriting = false }
         }
     }
 
@@ -278,7 +398,8 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun requestBluetoothPermissions() {
-        if (!bluetoothAdapter!!.isEnabled) {
+        val adapter = bluetoothAdapter
+        if (adapter == null || !adapter.isEnabled) {
             promptEnableBluetooth()
             return
         }
@@ -344,23 +465,50 @@ class MainActivity : AppCompatActivity() {
             requestBluetoothPermissions()
             return
         }
-        if (!bluetoothAdapter!!.isEnabled) {
+        val adapter = bluetoothAdapter
+        if (adapter == null || !adapter.isEnabled) {
             promptEnableBluetooth()
             return
         }
         updateStatus(getString(R.string.status_scanning))
-        bluetoothAdapter?.bluetoothLeScanner?.startScan(scanCallback)
+
+        // Filter by the NUS service UUID so the OS only wakes us for micro:bits.
+        val filter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid(NUS_SERVICE_UUID))
+            .build()
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        adapter.bluetoothLeScanner?.startScan(listOf(filter), settings, scanCallback)
+
+        handler.removeCallbacks(scanTimeoutRunnable)
+        handler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
+    }
+
+    private fun stopScan() {
+        handler.removeCallbacks(scanTimeoutRunnable)
+        try {
+            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "stopScan permission missing", e)
+        }
+    }
+
+    private val scanTimeoutRunnable = Runnable {
+        stopScan()
+        updateStatus(getString(R.string.status_scan_timeout))
     }
 
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            val name = device.name ?: return
-            if (name.contains("micro:bit", ignoreCase = true) ||
-                name.contains("BBC micro", ignoreCase = true)
+            val name = device.name
+            if (name != null &&
+                (name.contains("micro:bit", ignoreCase = true) ||
+                    name.contains("BBC micro", ignoreCase = true))
             ) {
-                bluetoothAdapter?.bluetoothLeScanner?.stopScan(this)
+                stopScan()
                 updateStatus(getString(R.string.status_found_connecting, name))
                 device.connectGatt(this@MainActivity, false, gattCallback)
             }
@@ -370,15 +518,14 @@ class MainActivity : AppCompatActivity() {
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            Log.d("Cutebot", "onConnectionStateChange status=$status newState=$newState")
+            Log.d(TAG, "onConnectionStateChange status=$status newState=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     bluetoothGatt = gatt
                     gatt.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    bluetoothGatt = null
-                    txCharacteristic = null
+                    disconnectGatt()
                     runOnUiThread { updateStatus(getString(R.string.status_disconnected)) }
                 }
             }
@@ -386,26 +533,72 @@ class MainActivity : AppCompatActivity() {
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            Log.d("Cutebot", "onServicesDiscovered status=$status")
+            Log.d(TAG, "onServicesDiscovered status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Service discovery failed: $status")
+                disconnectGatt()
+                updateStatus(getString(R.string.status_nus_not_found))
+                return
+            }
             val service: BluetoothGattService? = gatt.getService(NUS_SERVICE_UUID)
             if (service == null) {
-                runOnUiThread { updateStatus(getString(R.string.status_nus_not_found)) }
+                updateStatus(getString(R.string.status_nus_not_found))
                 return
             }
             // Phone writes to the RX characteristic (UUID ending in 0x3), which is
             // the WRITE characteristic. 0x2 is INDICATE-only (micro:bit -> phone).
-            txCharacteristic = service.getCharacteristic(NUS_WRITE_UUID)
-            if (txCharacteristic == null) {
-                runOnUiThread { updateStatus(getString(R.string.status_tx_not_found)) }
+            val characteristic = service.getCharacteristic(NUS_WRITE_UUID)
+            if (characteristic == null) {
+                updateStatus(getString(R.string.status_tx_not_found))
                 return
             }
-            Log.d("Cutebot", "TX characteristic properties=${txCharacteristic!!.properties}")
-            runOnUiThread { updateStatus(getString(R.string.status_connected_speak)) }
+            writeCharacteristic = characteristic
+            Log.d(TAG, "Write characteristic properties=${characteristic.properties}")
+            updateStatus(getString(R.string.status_connected_speak))
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            val success = status == BluetoothGatt.GATT_SUCCESS
+            Log.d(TAG, "onCharacteristicWrite status=$status")
+            if (!success) {
+                updateStatus(getString(R.string.status_write_failed, "BLE"))
+            }
+            val g = bluetoothGatt
+            val c = writeCharacteristic
+            if (g != null && c != null) {
+                flushWriteQueue(g, c)
+            } else {
+                synchronized(writeQueue) { isWriting = false }
+            }
         }
     }
 
+    private fun disconnectGatt() {
+        bluetoothGatt?.close()
+        bluetoothGatt = null
+        writeCharacteristic = null
+        synchronized(writeQueue) {
+            writeQueue.clear()
+            isWriting = false
+        }
+    }
+
+    // --- UI helpers ---
+
     private fun updateStatus(message: CharSequence) {
         runOnUiThread { statusText.text = message }
+    }
+
+    private fun updateListenButtonState() {
+        runOnUiThread {
+            listenButton.text = getString(
+                if (listeningContinuously) R.string.stop_listening else R.string.listen
+            )
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -421,7 +614,6 @@ class MainActivity : AppCompatActivity() {
             }
             REQUEST_RECORD_AUDIO -> {
                 if (allGranted) {
-                    listeningContinuously = true
                     startListening()
                 } else {
                     updateStatus(getString(R.string.status_microphone_permission_denied))
@@ -430,20 +622,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onDestroy() {
-        stopListening()
+    private fun closeModels() {
         modelEn?.close()
         modelNl?.close()
         modelEn = null
         modelNl = null
         currentModel = null
-        bluetoothGatt?.close()
-        bluetoothGatt = null
-        super.onDestroy()
-    }
-
-    companion object {
-        private const val REQUEST_RECORD_AUDIO = 1
-        private const val REQUEST_BLUETOOTH = 2
     }
 }

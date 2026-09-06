@@ -3,6 +3,7 @@
     <string name="app_name">Cutebot Voice Control</string>
     <string name="title">Cutebot Voice Control</string>
     <string name="listen">Listen</string>
+    <string name="stop_listening">Stop listening</string>
     <string name="stop">STOP</string>
     <string name="lang_toggle">Language: NL/EN</string>
     <string name="lang_dutch">Language: Dutch</string>
@@ -11,6 +12,8 @@
     <!-- Status messages -->
     <string name="status_listening">Listening…</string>
     <string name="status_ready">Ready. Tap Listen.</string>
+    <string name="status_loading_english">Loading English model…</string>
+    <string name="status_scan_timeout">micro:bit not found. Tap Listen to try again.</string>
     <string name="status_model_error">Speech model failed to load</string>
     <string name="status_heard">Heard: %1$s</string>
     <string name="status_scanning">Scanning for micro:bit…</string>
@@ -19,7 +22,7 @@
     <string name="status_sent">Sent: %1$s</string>
     <string name="status_write_failed">Failed to send: %1$s</string>
     <string name="status_nus_not_found">NUS service not found</string>
-    <string name="status_tx_not_found">TX characteristic not found</string>
+    <string name="status_tx_not_found">Write characteristic not found</string>
     <string name="status_connected_speak">Connected. Say a command.</string>
     <string name="status_listening_stopped">Listening stopped</string>
     <string name="status_disconnected">Disconnected from micro:bit</string>
@@ -27,10 +30,6 @@
     <string name="status_microphone_permission_denied">Microphone permission denied</string>
 
     <!-- Speech errors -->
-    <string name="speech_recognizer_unavailable">Speech recognizer unavailable on this device</string>
-    <string name="speech_error_no_match">Did not catch that; try again</string>
-    <string name="speech_error_network">Speech recognition network error</string>
-    <string name="speech_error_permission">Speech recognition permission missing</string>
     <string name="speech_error_internal">Speech error: %1$d</string>
 
     <!-- Bluetooth dialog -->
