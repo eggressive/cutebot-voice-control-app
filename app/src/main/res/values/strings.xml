@@ -3,9 +3,15 @@
     <string name="app_name">Cutebot Voice Control</string>
     <string name="title">Cutebot Voice Control</string>
     <string name="listen">Listen</string>
+    <string name="stop">STOP</string>
+    <string name="lang_toggle">Language: NL/EN</string>
+    <string name="lang_dutch">Language: Dutch</string>
+    <string name="lang_english">Language: English</string>
 
     <!-- Status messages -->
     <string name="status_listening">Listening…</string>
+    <string name="status_ready">Ready. Tap Listen.</string>
+    <string name="status_model_error">Speech model failed to load</string>
     <string name="status_heard">Heard: %1$s</string>
     <string name="status_scanning">Scanning for micro:bit…</string>
     <string name="status_found_connecting">Found: %1$s, connecting…</string>

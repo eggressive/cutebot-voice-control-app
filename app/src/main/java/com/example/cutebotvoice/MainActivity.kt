@@ -17,32 +17,50 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.vosk.LibVosk
+import org.vosk.LogLevel
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.RecognitionListener
+import org.vosk.android.SpeechService
+import org.vosk.android.StorageService
+import java.io.IOException
 import java.util.UUID
 
-// Nordic UART Service (NUS) UUIDs, the service the micro:bit BLE UART advertises.
-// 0x2 = TX (phone -> micro:bit). 0x3 = RX (micro:bit -> phone, notify only).
+// micro:bit UART service UUIDs. NOTE: the micro:bit uses its OWN naming, which is
+// the OPPOSITE of the standard Nordic NUS convention:
+//   6e400002 = TX  (micro:bit -> phone, INDICATE only, NOT writable)
+//   6e400003 = RX  (phone -> micro:bit, WRITE)  <- the phone writes to THIS one
 private val NUS_SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-private val NUS_TX_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
-private val NUS_RX_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+private val NUS_WRITE_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+private val NUS_NOTIFY_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var speechRecognizer: SpeechRecognizer
     private lateinit var statusText: TextView
     private lateinit var listenButton: Button
+    private lateinit var stopButton: Button
+    private lateinit var langButton: Button
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var txCharacteristic: BluetoothGattCharacteristic? = null
+
+    // Vosk speech recognition (offline, English + Dutch models bundled).
+    private var modelEn: Model? = null
+    private var modelNl: Model? = null
+    private var currentModel: Model? = null
+    private var speechService: SpeechService? = null
     private var listeningContinuously: Boolean = false
+    private var lastSentCommand: String? = null
+    private var lastSentAt: Long = 0L
+    private var useDutch: Boolean = true  // grandson is Dutch; default to Dutch
 
     private val bluetoothAdapter: BluetoothAdapter?
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -53,16 +71,58 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         listenButton = findViewById(R.id.listenButton)
+        stopButton = findViewById(R.id.stopButton)
+        langButton = findViewById(R.id.langButton)
 
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        speechRecognizer.setRecognitionListener(recognitionListener)
+        LibVosk.setLogLevel(LogLevel.WARNINGS)
 
         listenButton.setOnClickListener { onListenClicked() }
+        stopButton.setOnClickListener { writeCommand("4") }
+        langButton.setOnClickListener { toggleLanguage() }
 
         requestBluetoothPermissions()
+        initModels()
     }
 
-    // --- speech recognition ---
+    // --- Vosk models + speech ---
+
+    private fun initModels() {
+        // Unpack both models. Dutch is the default (grandson is Dutch); English is
+        // available via the language toggle. Both share the same command map.
+        StorageService.unpack(
+            this, "model-nl", "model-nl",
+            { m ->
+                modelNl = m
+                if (useDutch) {
+                    currentModel = m
+                    updateStatus(getString(R.string.status_ready))
+                }
+            },
+            { e ->
+                Log.e("Cutebot", "Failed to unpack Dutch model", e)
+                updateStatus(getString(R.string.status_model_error))
+            }
+        )
+        StorageService.unpack(
+            this, "model-en-us", "model-en-us",
+            { m ->
+                modelEn = m
+                if (!useDutch) {
+                    currentModel = m
+                    updateStatus(getString(R.string.status_ready))
+                }
+            },
+            { e ->
+                Log.e("Cutebot", "Failed to unpack English model", e)
+            }
+        )
+    }
+
+    private fun toggleLanguage() {
+        useDutch = !useDutch
+        currentModel = if (useDutch) modelNl else modelEn
+        updateStatus(getString(if (useDutch) R.string.lang_dutch else R.string.lang_english))
+    }
 
     private fun onListenClicked() {
         if (listeningContinuously) {
@@ -70,106 +130,87 @@ class MainActivity : AppCompatActivity() {
             updateStatus(getString(R.string.status_listening_stopped))
             return
         }
-        when {
-            !hasPermission(Manifest.permission.RECORD_AUDIO) -> {
-                requestPermission(Manifest.permission.RECORD_AUDIO, REQUEST_RECORD_AUDIO)
-            }
-            SpeechRecognizer.isRecognitionAvailable(this) -> {
-                listeningContinuously = true
-                startListening()
-            }
-            else -> {
-                updateStatus(getString(R.string.speech_recognizer_unavailable))
-            }
+        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            requestPermission(Manifest.permission.RECORD_AUDIO, REQUEST_RECORD_AUDIO)
+            return
         }
+        startListening()
     }
 
     private fun startListening() {
+        val m = currentModel
+        if (m == null) {
+            updateStatus(getString(R.string.status_model_error))
+            return
+        }
         if (!hasPermission(Manifest.permission.RECORD_AUDIO)) {
             listeningContinuously = false
             return
         }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            // Keep listening until the user stops speaking; we restart in onResults.
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000)
+        try {
+            val rec = Recognizer(m, 16000.0f)
+            speechService = SpeechService(rec, 16000.0f)
+            speechService?.startListening(recognitionListener)
+            listeningContinuously = true
+            updateStatus(getString(R.string.status_listening))
+        } catch (e: IOException) {
+            Log.e("Cutebot", "Failed to start speech service", e)
+            updateStatus(getString(R.string.status_model_error))
         }
-        speechRecognizer.startListening(intent)
-        updateStatus(getString(R.string.status_listening))
     }
 
     private fun stopListening() {
         listeningContinuously = false
-        speechRecognizer.stopListening()
+        speechService?.stop()
+        speechService = null
     }
 
     private val recognitionListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-
-        override fun onError(error: Int) {
-            // Common recoverable errors: ERROR_NO_MATCH, ERROR_SPEECH_TIMEOUT, ERROR_NETWORK_TIMEOUT.
-            // Fatal errors: ERROR_INSUFFICIENT_PERMISSIONS, ERROR_CLIENT, ERROR_RECOGNIZER_BUSY.
-            when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
-                    updateStatus(getString(R.string.speech_error_no_match))
-                    if (listeningContinuously) restartListeningSoon()
-                }
-                SpeechRecognizer.ERROR_NETWORK,
-                SpeechRecognizer.ERROR_SERVER -> {
-                    updateStatus(getString(R.string.speech_error_network))
-                    listeningContinuously = false
-                }
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    updateStatus(getString(R.string.speech_error_permission))
-                    listeningContinuously = false
-                }
-                SpeechRecognizer.ERROR_CLIENT,
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
-                    updateStatus(getString(R.string.speech_error_internal, error))
-                    listeningContinuously = false
-                }
-                else -> {
-                    updateStatus(getString(R.string.speech_error_internal, error))
-                    if (listeningContinuously) restartListeningSoon()
-                }
-            }
-        }
-
-        override fun onResults(results: Bundle?) {
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val text = matches?.firstOrNull()
-            if (text != null) {
-                updateStatus(getString(R.string.status_heard, text))
-                handleCommand(text)
-            } else {
-                updateStatus(getString(R.string.speech_error_no_match))
-            }
-            if (listeningContinuously) restartListeningSoon()
-        }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val text = matches?.firstOrNull() ?: return
+        override fun onPartialResult(hypothesis: String) {
+            val text = extractText(hypothesis) ?: return
             updateStatus(getString(R.string.status_heard, text))
-            // Do not issue motor commands on partial results; only final onResults.
+            handleCommand(text)
         }
 
-        override fun onEvent(eventType: Int, params: Bundle?) {}
+        override fun onResult(hypothesis: String) {
+            val text = extractText(hypothesis) ?: return
+            updateStatus(getString(R.string.status_heard, text))
+            handleCommand(text)
+        }
+
+        override fun onFinalResult(hypothesis: String) {
+            val text = extractText(hypothesis) ?: return
+            updateStatus(getString(R.string.status_heard, text))
+            handleCommand(text)
+        }
+
+        override fun onError(e: Exception) {
+            Log.e("Cutebot", "Speech error", e)
+            updateStatus(getString(R.string.speech_error_internal, 0))
+        }
+
+        override fun onTimeout() {
+            // Vosk times out after silence; restart if still in continuous mode.
+            if (listeningContinuously) {
+                restartListeningSoon()
+            }
+        }
+    }
+
+    // Vosk returns JSON like {"text": "left"}. Extract the "text" field.
+    private fun extractText(hypothesis: String): String? {
+        val start = hypothesis.indexOf("\"text\"")
+        if (start < 0) return null
+        val colon = hypothesis.indexOf(':', start)
+        if (colon < 0) return null
+        val quote = hypothesis.indexOf('"', colon + 1)
+        if (quote < 0) return null
+        val end = hypothesis.indexOf('"', quote + 1)
+        if (end < 0) return null
+        return hypothesis.substring(quote + 1, end)
     }
 
     private fun restartListeningSoon() {
-        // Avoid tight loop on recognizer busy.
         listenButton.postDelayed({ startListening() }, 400)
     }
 
@@ -181,9 +222,16 @@ class MainActivity : AppCompatActivity() {
             lower.contains("forward") || lower.contains("vooruit") -> "1"
             lower.contains("left") || lower.contains("links") -> "2"
             lower.contains("right") || lower.contains("rechts") -> "3"
-            lower.contains("stop") || lower.contains("halt") -> "4"
+            lower.contains("stop") || lower.contains("halt") || lower.contains("stop") -> "4"
             else -> return
         }
+        // Debounce: skip if the same command was sent within the last 1.5s.
+        val now = System.currentTimeMillis()
+        if (command == lastSentCommand && now - lastSentAt < 1500) {
+            return
+        }
+        lastSentCommand = command
+        lastSentAt = now
         writeCommand(command)
     }
 
@@ -205,14 +253,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val written = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            // API 33+ writeCharacteristic returns a status Int; 0 means success.
-            gatt.writeCharacteristic(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
-                android.bluetooth.BluetoothStatusCodes.SUCCESS
+            val status = gatt.writeCharacteristic(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+            Log.d("Cutebot", "writeCharacteristic status=$status")
+            status == android.bluetooth.BluetoothStatusCodes.SUCCESS
         } else {
+            @Suppress("DEPRECATION")
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             @Suppress("DEPRECATION")
             characteristic.value = payload
             @Suppress("DEPRECATION")
-            gatt.writeCharacteristic(characteristic)
+            val ok = gatt.writeCharacteristic(characteristic)
+            Log.d("Cutebot", "writeCharacteristic (legacy) returned=$ok")
+            ok
         }
         if (written) {
             updateStatus(getString(R.string.status_sent, command))
@@ -317,6 +369,7 @@ class MainActivity : AppCompatActivity() {
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.d("Cutebot", "onConnectionStateChange status=$status newState=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     bluetoothGatt = gatt
@@ -332,17 +385,20 @@ class MainActivity : AppCompatActivity() {
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            Log.d("Cutebot", "onServicesDiscovered status=$status")
             val service: BluetoothGattService? = gatt.getService(NUS_SERVICE_UUID)
             if (service == null) {
                 runOnUiThread { updateStatus(getString(R.string.status_nus_not_found)) }
                 return
             }
-            // Phone writes to the TX characteristic (UUID ending in 0x2).
-            txCharacteristic = service.getCharacteristic(NUS_TX_UUID)
+            // Phone writes to the RX characteristic (UUID ending in 0x3), which is
+            // the WRITE characteristic. 0x2 is INDICATE-only (micro:bit -> phone).
+            txCharacteristic = service.getCharacteristic(NUS_WRITE_UUID)
             if (txCharacteristic == null) {
                 runOnUiThread { updateStatus(getString(R.string.status_tx_not_found)) }
                 return
             }
+            Log.d("Cutebot", "TX characteristic properties=${txCharacteristic!!.properties}")
             runOnUiThread { updateStatus(getString(R.string.status_connected_speak)) }
         }
     }
@@ -375,7 +431,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         stopListening()
-        speechRecognizer.destroy()
+        modelEn?.close()
+        modelNl?.close()
+        modelEn = null
+        modelNl = null
+        currentModel = null
         bluetoothGatt?.close()
         bluetoothGatt = null
         super.onDestroy()

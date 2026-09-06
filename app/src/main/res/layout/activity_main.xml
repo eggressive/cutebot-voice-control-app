@@ -21,4 +21,19 @@
         android:layout_marginTop="24dp"
         android:text="@string/listen" />
 
+    <Button
+        android:id="@+id/stopButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/stop"
+        android:backgroundTint="@android:color/holo_red_dark" />
+
+    <Button
+        android:id="@+id/langButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/lang_toggle" />
+
 </LinearLayout>

@@ -17,3 +17,7 @@ local.properties
 *.apk
 *.aab
 captures/
+
+# Vosk speech models (large binaries, fetched via fetch-models.sh)
+app/src/main/assets/model-en-us/
+app/src/main/assets/model-nl/
