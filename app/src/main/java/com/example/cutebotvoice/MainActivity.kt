@@ -222,7 +222,8 @@ class MainActivity : AppCompatActivity() {
             lower.contains("forward") || lower.contains("vooruit") -> "1"
             lower.contains("left") || lower.contains("links") -> "2"
             lower.contains("right") || lower.contains("rechts") -> "3"
-            lower.contains("stop") || lower.contains("halt") || lower.contains("stop") -> "4"
+            lower.contains("stop") || lower.contains("halt") -> "4"
+            lower.contains("back") || lower.contains("achteruit") || lower.contains("achter") -> "5"
             else -> return
         }
         // Debounce: skip if the same command was sent within the last 1.5s.
