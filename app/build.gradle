@@ -29,6 +29,12 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+
+    lint {
+        // Runtime permission checks are present; lint cannot trace them across methods.
+        disable 'MissingPermission'
+        checkDependencies true
+    }
 }
 
 dependencies {

@@ -33,6 +33,9 @@ NUS UUIDs:
 - TX (phone -> micro:bit): `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
 - RX (micro:bit -> phone): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
 
+The phone writes command bytes followed by a newline to the TX characteristic.
+Make sure the firmware reads with a newline delimiter or strips it before dispatching.
+
 ## Build
 
 Requires JDK 17 and the Android SDK (platform 34, build-tools 34).
@@ -47,3 +50,6 @@ Requires JDK 17 and the Android SDK (platform 34, build-tools 34).
 - `RECORD_AUDIO` (speech recognition)
 - `BLUETOOTH_SCAN` / `BLUETOOTH_CONNECT` (Android 12+)
 - `BLUETOOTH` / `BLUETOOTH_ADMIN` (Android 11 and below)
+- `ACCESS_FINE_LOCATION` (required for BLE scanning on Android 6 through 11)
+
+The app also declares `android.hardware.bluetooth_le` as required.
